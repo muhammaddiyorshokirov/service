@@ -1,0 +1,53 @@
+# dependencies
+node_modules/
+
+# build output
+dist/
+build/
+
+# env files
+.env
+.env.*
+!.env.example
+
+# logs
+logs/
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+
+# OS / editor
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+
+# temp files
+tmp/
+temp/
+.cache/
+
+# local database
+*.db
+*.db-shm
+*.db-wal
+data/
+
+# media working files
+storage/
+uploads/
+media/
+workdir/
+
+# ffmpeg generated temp files
+*.ts
+*.m3u8
+
+# coverage
+coverage/
+
+# misc
+*.pid
+*.seed

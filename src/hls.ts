@@ -1,51 +1,41 @@
 import { spawn } from "node:child_process";
 import { writeFile } from "node:fs/promises";
 import { dirname, join } from "node:path";
-import ffmpegInstaller from "@ffmpeg-installer/ffmpeg";
-import ffprobeInstaller from "@ffprobe-installer/ffprobe";
 import type { MediaProbe, PlaylistSegment } from "./types.js";
 import { buildVodPlaylist, ensureDir, parsePlaylistSegments } from "./utils.js";
 
-export const ffmpegBinaryPath = ffmpegInstaller.path;
-export const ffprobeBinaryPath = ffprobeInstaller.path;
+export const ffmpegBinaryPath = process.env.FFMPEG_PATH || "ffmpeg";
 
 export async function probeMedia(inputPath: string): Promise<MediaProbe> {
-  const raw = await runProcess(ffprobeBinaryPath, [
-    "-v",
-    "error",
-    "-print_format",
-    "json",
-    "-show_format",
-    "-show_streams",
+  const raw = await runProcess(ffmpegBinaryPath, [
+    "-hide_banner",
+    "-i",
     inputPath,
+    "-t",
+    "0",
+    "-f",
+    "null",
+    "-",
   ]);
-
-  const parsed = JSON.parse(raw.stdout);
-  const videoStream = Array.isArray(parsed.streams)
-    ? parsed.streams.find((stream: Record<string, unknown>) => stream.codec_type === "video")
-    : null;
-  const audioStream = Array.isArray(parsed.streams)
-    ? parsed.streams.find((stream: Record<string, unknown>) => stream.codec_type === "audio")
-    : null;
-  const durationRaw = parsed.format?.duration ?? videoStream?.duration ?? audioStream?.duration;
-  const durationSeconds = Number(durationRaw);
+  const parsed = parseFfmpegProbe(raw.stderr);
+  const durationSeconds = parsed.durationSeconds;
 
   if (!Number.isFinite(durationSeconds) || durationSeconds <= 0) {
     throw new Error("Video duration could not be determined");
   }
 
-  const bitrate = Number(parsed.format?.bit_rate);
-  const width = Number(videoStream?.width);
-  const height = Number(videoStream?.height);
-
   return {
     durationSeconds,
-    bitrate: Number.isFinite(bitrate) ? Math.round(bitrate) : null,
-    width: Number.isFinite(width) ? width : null,
-    height: Number.isFinite(height) ? height : null,
-    videoCodec: typeof videoStream?.codec_name === "string" ? videoStream.codec_name : null,
-    audioCodec: typeof audioStream?.codec_name === "string" ? audioStream.codec_name : null,
-    raw: parsed,
+    bitrate: parsed.bitrate,
+    width: parsed.width,
+    height: parsed.height,
+    videoCodec: parsed.videoCodec,
+    audioCodec: parsed.audioCodec,
+    raw: {
+      command: ffmpegBinaryPath,
+      stderr: raw.stderr,
+      parsed,
+    },
   };
 }
 
@@ -175,4 +165,57 @@ function runProcess(command: string, args: string[]) {
       reject(new Error(stderr || `Process exited with code ${code}`));
     });
   });
+}
+
+function parseFfmpegProbe(stderr: string) {
+  const durationMatch = stderr.match(/Duration:\s*(\d+):(\d+):(\d+(?:\.\d+)?)/);
+  const durationSeconds = durationMatch
+    ? Number(durationMatch[1]) * 3600 + Number(durationMatch[2]) * 60 + Number(durationMatch[3])
+    : NaN;
+
+  const bitrateMatch = stderr.match(/bitrate:\s*([0-9.]+)\s*([kmg])?b\/s/i);
+  const bitrate = bitrateMatch ? normalizeBitrate(bitrateMatch[1], bitrateMatch[2]) : null;
+
+  const lines = stderr
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter(Boolean);
+
+  const videoLine = lines.find((line) => line.includes("Video:")) || null;
+  const audioLine = lines.find((line) => line.includes("Audio:")) || null;
+
+  const resolutionMatch = videoLine?.match(/(?:^|,\s*)(\d{2,5})x(\d{2,5})(?:[\s,\[]|$)/);
+
+  return {
+    durationSeconds,
+    bitrate,
+    width: resolutionMatch ? Number(resolutionMatch[1]) : null,
+    height: resolutionMatch ? Number(resolutionMatch[2]) : null,
+    videoCodec: parseCodecName(videoLine, "Video:"),
+    audioCodec: parseCodecName(audioLine, "Audio:"),
+  };
+}
+
+function parseCodecName(line: string | null, marker: "Video:" | "Audio:") {
+  if (!line) return null;
+  const afterMarker = line.split(marker)[1]?.trim();
+  if (!afterMarker) return null;
+  const codecMatch = afterMarker.match(/^([a-z0-9._-]+)/i);
+  return codecMatch ? codecMatch[1].toLowerCase() : null;
+}
+
+function normalizeBitrate(rawValue: string, unit: string | undefined) {
+  const value = Number(rawValue);
+  if (!Number.isFinite(value) || value <= 0) return null;
+
+  switch ((unit || "k").toLowerCase()) {
+    case "g":
+      return Math.round(value * 1_000_000_000);
+    case "m":
+      return Math.round(value * 1_000_000);
+    case "k":
+      return Math.round(value * 1_000);
+    default:
+      return Math.round(value);
+  }
 }

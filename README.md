@@ -19,6 +19,7 @@ Set these variables before running:
 - `MEDIA_WORKDIR`
 - `MAX_UPLOAD_BYTES`
 - `ALLOWED_ORIGINS`
+- `FFMPEG_PATH` (optional, default: `ffmpeg`)
 - `NODE_OPTIONS=--max-old-space-size=384`
 
 ## Run
@@ -28,7 +29,8 @@ npm install
 npm run dev
 ```
 
-The service bundles `ffmpeg` and `ffprobe` through installer packages, so it does not depend on system binaries.
+The service now uses the system `ffmpeg` binary for both metadata probing and media processing.
+On Render native environments, `ffmpeg` is available by default, so the default `FFMPEG_PATH=ffmpeg` is sufficient.
 
 ## Expected domains
 
