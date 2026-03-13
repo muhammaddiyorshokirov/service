@@ -10,6 +10,7 @@
     "dev": "tsx watch src/server.ts",
     "build": "tsc -p tsconfig.json",
     "rebuild:native": "npm rebuild better-sqlite3",
+    "render:build": "npm ci && npm run rebuild:native && npm run build",
     "start": "node dist/server.js"
   },
   "dependencies": {
