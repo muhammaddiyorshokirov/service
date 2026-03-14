@@ -1,14 +1,20 @@
 import { createClient, type SupabaseClient } from "@supabase/supabase-js";
 import type { AuthContext, EpisodeContext } from "./types.js";
 
+export interface EpisodeMediaState {
+  videoUrl: string | null;
+  streamUrl: string | null;
+  subtitleUrl: string | null;
+}
+
 interface SyncEpisodeMediaInput {
   episodeId: string;
   channelId: string;
-  videoUrl: string;
-  videoObjectKey: string;
-  videoFileName: string;
-  videoMimeType: string;
-  videoSizeBytes: number;
+  videoUrl: string | null;
+  videoObjectKey: string | null;
+  videoFileName: string | null;
+  videoMimeType: string | null;
+  videoSizeBytes: number | null;
   subtitleUrl: string | null;
   subtitleObjectKey: string | null;
   subtitleFileName: string | null;
@@ -19,7 +25,6 @@ interface SyncEpisodeMediaInput {
   requestedBy: string;
   ownerUserId: string;
   contentId: string;
-  r2Prefix: string;
   durationSeconds: number;
 }
 
@@ -106,16 +111,63 @@ export class SupabaseBridge {
     }
   }
 
+  async getEpisodeMedia(episodeId: string): Promise<EpisodeMediaState> {
+    const { data, error } = await this.serviceClient
+      .from("episodes")
+      .select("video_url, stream_url, subtitle_url")
+      .eq("id", episodeId)
+      .maybeSingle();
+
+    if (error) throw error;
+    if (!data) {
+      throw new Error("Episode not found");
+    }
+
+    return {
+      videoUrl: data.video_url || null,
+      streamUrl: data.stream_url || null,
+      subtitleUrl: data.subtitle_url || null,
+    };
+  }
+
   async syncEpisodeMedia(input: SyncEpisodeMediaInput) {
-    const deleteRes = await this.serviceClient
+    const { data: existingAssets, error: existingAssetsError } = await this.serviceClient
       .from("storage_assets")
-      .delete()
-      .like("object_key", `${input.r2Prefix}/%`);
+      .select("id, object_key")
+      .eq("episode_id", input.episodeId)
+      .eq("source_table", "episodes")
+      .in("source_column", ["video_url", "stream_url", "subtitle_url"]);
 
-    if (deleteRes.error) throw deleteRes.error;
+    if (existingAssetsError) throw existingAssetsError;
 
-    const rows: Array<Record<string, unknown>> = [
-      {
+    const keepKeys = new Set(
+      [input.videoObjectKey, input.streamObjectKey, input.subtitleObjectKey].filter(
+        (value): value is string => Boolean(value),
+      ),
+    );
+    const staleAssetIds = (existingAssets || [])
+      .filter((asset) => !keepKeys.has(asset.object_key))
+      .map((asset) => asset.id);
+
+    if (staleAssetIds.length) {
+      const deleteRes = await this.serviceClient
+        .from("storage_assets")
+        .delete()
+        .in("id", staleAssetIds);
+
+      if (deleteRes.error) throw deleteRes.error;
+    }
+
+    const rows: Array<Record<string, unknown>> = [];
+
+    if (
+      input.videoUrl &&
+      input.videoObjectKey &&
+      input.videoFileName &&
+      input.videoMimeType &&
+      typeof input.videoSizeBytes === "number"
+    ) {
+      rows.push({
         bucket_name: "default",
         object_key: input.videoObjectKey,
         public_url: input.videoUrl,
@@ -133,7 +185,10 @@ export class SupabaseBridge {
         source_table: "episodes",
         source_column: "video_url",
         metadata: { upload_source: "media-service", logical_asset: false },
-      },
+      });
+    }
+
+    rows.push(
       {
         bucket_name: "default",
         object_key: input.streamObjectKey,
@@ -153,7 +208,7 @@ export class SupabaseBridge {
         source_column: "stream_url",
         metadata: { upload_source: "media-service", hls_package: true, logical_asset: true },
       },
-    ];
+    );
 
     if (input.subtitleUrl && input.subtitleObjectKey && input.subtitleFileName) {
       rows.push({
@@ -177,11 +232,13 @@ export class SupabaseBridge {
       });
     }
 
-    const upsertRes = await this.serviceClient
-      .from("storage_assets")
-      .upsert(rows, { onConflict: "bucket_name,object_key" });
+    if (rows.length) {
+      const upsertRes = await this.serviceClient
+        .from("storage_assets")
+        .upsert(rows, { onConflict: "bucket_name,object_key" });
 
-    if (upsertRes.error) throw upsertRes.error;
+      if (upsertRes.error) throw upsertRes.error;
+    }
 
     const updateEpisodeRes = await this.serviceClient
       .from("episodes")

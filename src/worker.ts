@@ -112,6 +112,7 @@ export class MediaJobWorker {
       const hlsDir = join(workDir, "hls");
       const branchesDir = join(hlsDir, "branches");
       const subtitleDir = join(hlsDir, "subtitles");
+      const previousMedia = await this.supabase.getEpisodeMedia(job.episode_id);
       await ensureDir(branchesDir);
 
       const probe = await probeMedia(job.source_video_path);
@@ -146,6 +147,7 @@ export class MediaJobWorker {
       const mediaPlaylistPath = join(hlsDir, "media.m3u8");
       const masterPlaylistPath = join(hlsDir, "master.m3u8");
       await this.buildFinalPlaylists(job.id, mediaPlaylistPath, masterPlaylistPath, probe, Boolean(job.source_subtitle_path));
+      await this.cleanupInputArtifacts(job.id);
 
       job = this.store.updateJob(job.id, {
         status: "uploading",
@@ -157,27 +159,20 @@ export class MediaJobWorker {
       await this.r2.clearPrefix(job.r2_prefix);
       await this.uploadOutputs(job, hlsDir);
 
-      const sourceVideoObjectKey = `${job.r2_prefix}/source/video.${job.source_video_ext}`;
-      const sourceVideoUrl = this.r2.getPublicUrl(sourceVideoObjectKey);
+      const sourceVideoObjectKey = null;
+      const sourceVideoUrl = null;
       const streamObjectKey = `${job.r2_prefix}/hls/master.m3u8`;
       const streamUrl = this.r2.getPublicUrl(streamObjectKey);
       const hlsSize = await getDirectorySize(hlsDir);
-
-      if (job.source_subtitle_path) {
-        subtitleObjectKey = `${job.r2_prefix}/source/subtitle.vtt`;
-        subtitleUrl = this.r2.getPublicUrl(subtitleObjectKey);
-        subtitleFileName = "subtitle.vtt";
-        subtitleSizeBytes = (await stat(join(hlsDir, "subtitles", "subtitles.vtt"))).size;
-      }
 
       await this.supabase.syncEpisodeMedia({
         episodeId: job.episode_id,
         channelId: job.channel_id,
         videoUrl: sourceVideoUrl,
         videoObjectKey: sourceVideoObjectKey,
-        videoFileName: `video.${job.source_video_ext}`,
-        videoMimeType: this.inferVideoMimeType(job.source_video_ext),
-        videoSizeBytes: (await stat(job.source_video_path)).size,
+        videoFileName: null,
+        videoMimeType: null,
+        videoSizeBytes: null,
         subtitleUrl,
         subtitleObjectKey,
         subtitleFileName,
@@ -188,8 +183,12 @@ export class MediaJobWorker {
         requestedBy: job.requested_by,
         ownerUserId: job.owner_user_id,
         contentId: job.content_id,
-        r2Prefix: job.r2_prefix,
         durationSeconds: probe.durationSeconds,
+      });
+      await this.cleanupObsoleteEpisodeAssets(previousMedia, {
+        currentRootPrefix: job.r2_prefix,
+        currentStreamObjectKey: streamObjectKey,
+        currentSubtitleObjectKey: subtitleObjectKey,
       });
 
       this.store.addEvent(job.id, "info", "Job completed", {
@@ -234,6 +233,11 @@ export class MediaJobWorker {
     } finally {
       this.activeChild = null;
       this.activeJobId = null;
+      try {
+        await removeDirIfExists(join(config.mediaWorkDir, job.id));
+      } catch (cleanupError) {
+        this.logger.warn({ cleanupError, jobId: job.id }, "Failed to cleanup media work directory");
+      }
     }
   }
 
@@ -467,26 +471,72 @@ export class MediaJobWorker {
 
     return {
       localPath: outputPath,
-      objectKey: `${job.r2_prefix}/source/subtitle.vtt`,
-      publicUrl: this.r2.getPublicUrl(`${job.r2_prefix}/source/subtitle.vtt`),
-      fileName: "subtitle.vtt",
+      objectKey: `${job.r2_prefix}/hls/subtitles/subtitles.vtt`,
+      publicUrl: this.r2.getPublicUrl(`${job.r2_prefix}/hls/subtitles/subtitles.vtt`),
+      fileName: "subtitles.vtt",
       sizeBytes: (await stat(outputPath)).size,
     };
   }
 
   private async uploadOutputs(job: JobRow, hlsDir: string) {
-    const sourceDir = join(config.mediaWorkDir, job.id, "source");
-    await removeDirIfExists(sourceDir);
-    await ensureDir(sourceDir);
+    await this.r2.uploadDirectory(hlsDir, `${job.r2_prefix}/hls`);
+  }
 
-    await copyFile(job.source_video_path, join(sourceDir, `video.${job.source_video_ext}`));
+  private async cleanupInputArtifacts(jobId: string) {
+    await removeDirIfExists(join(config.mediaWorkDir, jobId, "input"));
+  }
 
-    if (job.source_subtitle_path) {
-      await copyFile(join(hlsDir, "subtitles", "subtitles.vtt"), join(sourceDir, "subtitle.vtt"));
+  private async cleanupObsoleteEpisodeAssets(
+    previousMedia: { videoUrl: string | null; streamUrl: string | null; subtitleUrl: string | null },
+    current: {
+      currentRootPrefix: string;
+      currentStreamObjectKey: string;
+      currentSubtitleObjectKey: string | null;
+    },
+  ) {
+    const protectedKeys = new Set(
+      [current.currentStreamObjectKey, current.currentSubtitleObjectKey].filter(
+        (value): value is string => Boolean(value),
+      ),
+    );
+    const exactKeys = new Set<string>();
+    const prefixes = new Set<string>();
+
+    const collect = (url?: string | null) => {
+      const objectKey = this.extractObjectKeyFromUrl(url);
+      if (!objectKey) return;
+      if (protectedKeys.has(objectKey)) return;
+      if (objectKey.startsWith(`${current.currentRootPrefix}/`)) return;
+
+      if (objectKey.toLowerCase().endsWith(".m3u8")) {
+        const prefix = this.getParentPrefix(objectKey);
+        if (prefix) {
+          prefixes.add(prefix);
+        }
+        return;
+      }
+
+      exactKeys.add(objectKey);
+    };
+
+    collect(previousMedia.videoUrl);
+    collect(previousMedia.streamUrl);
+    collect(previousMedia.subtitleUrl);
+
+    for (const key of [...exactKeys]) {
+      const coveredByPrefix = [...prefixes].some((prefix) => key.startsWith(`${prefix}/`));
+      if (coveredByPrefix) {
+        exactKeys.delete(key);
+      }
     }
 
-    await this.r2.uploadDirectory(sourceDir, `${job.r2_prefix}/source`);
-    await this.r2.uploadDirectory(hlsDir, `${job.r2_prefix}/hls`);
+    for (const prefix of prefixes) {
+      await this.r2.clearPrefix(prefix);
+    }
+
+    if (exactKeys.size) {
+      await this.r2.deleteObjects([...exactKeys]);
+    }
   }
 
   private async runFfmpeg(args: string[], jobId: string) {
@@ -561,5 +611,21 @@ export class MediaJobWorker {
     if (job?.cancel_requested) {
       throw new CancelledError(job.cancel_reason || "Cancelled by user");
     }
+  }
+
+  private extractObjectKeyFromUrl(url?: string | null) {
+    if (!url) return null;
+
+    try {
+      return new URL(url).pathname.replace(/^\/+/, "") || null;
+    } catch {
+      return url.split("?")[0]?.replace(/^\/+/, "") || null;
+    }
+  }
+
+  private getParentPrefix(objectKey: string) {
+    const parts = objectKey.split("/").filter(Boolean);
+    if (parts.length <= 1) return null;
+    return parts.slice(0, -1).join("/");
   }
 }

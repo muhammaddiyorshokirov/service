@@ -71,6 +71,24 @@ export class R2Storage {
     } while (continuationToken);
   }
 
+  async deleteObjects(objectKeys: string[]) {
+    const keys = [...new Set(objectKeys.filter(Boolean))];
+    if (!keys.length) return;
+
+    for (let index = 0; index < keys.length; index += 1000) {
+      const batch = keys.slice(index, index + 1000);
+      await this.client.send(
+        new DeleteObjectsCommand({
+          Bucket: this.bucketName,
+          Delete: {
+            Objects: batch.map((key) => ({ Key: key })),
+            Quiet: true,
+          },
+        }),
+      );
+    }
+  }
+
   async uploadFile(localPath: string, objectKey: string) {
     const body = await readFile(localPath);
     await this.client.send(
